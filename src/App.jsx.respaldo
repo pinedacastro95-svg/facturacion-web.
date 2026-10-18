@@ -1,0 +1,382 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { jsPDF } from 'jspdf';
+import {
+  Activity, BadgeDollarSign, FileText, LayoutDashboard, LogOut,
+  Plus, Search, Users, Wallet, RefreshCw, CircleAlert, Menu
+} from 'lucide-react';
+import { configured, supabase } from './supabase';
+
+const money = value => new Intl.NumberFormat('es-NI', {
+  style: 'currency', currency: 'NIO', maximumFractionDigits: 2
+}).format(Number(value || 0));
+
+export default function App() {
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('dashboard');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [clients, setClients] = useState([]);
+  const [invoices, setInvoices] = useState([]);
+  const [search, setSearch] = useState('');
+  const [clientForm, setClientForm] = useState({ name: '', phone: '', email: '', address: '' });
+  const [invoiceForm, setInvoiceForm] = useState({ client_id: '', description: '', amount: '', service_type: 'ocasional', recurrence: 'mensual', due_date: '' });
+  const [paymentForm, setPaymentForm] = useState({ invoice_id: '', amount: '', method: 'efectivo', reference: '' });
+  const [billingMonth, setBillingMonth] = useState(new Date().toISOString().slice(0, 7));
+
+  useEffect(() => {
+    if (!configured) { setLoading(false); return; }
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (session) loadData();
+  }, [session]);
+
+  async function loadData() {
+    if (!supabase || !session) return;
+
+    setBusy(true);
+    setError('');
+
+    try {
+      const [c, i] = await Promise.all([
+        supabase.from('clients').select('*').order('created_at', { ascending: false }),
+        supabase.from('invoices').select('*, clients(name), payments(amount)').order('created_at', { ascending: false })
+      ]);
+
+      if (c.error) throw new Error('Error al cargar clientes: ' + c.error.message);
+      if (i.error) throw new Error('Error al cargar facturas: ' + i.error.message);
+
+      setClients(c.data || []);
+      setInvoices(i.data || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'No se pudieron cargar los datos.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signIn(e) {
+    e.preventDefault(); setBusy(true); setError('');
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) setError(error.message);
+    setBusy(false);
+  }
+
+  async function addClient(e) {
+    e.preventDefault(); setBusy(true); setError(''); setNotice('');
+    const { error } = await supabase.from('clients').insert({
+      ...clientForm, user_id: session.user.id
+    });
+    if (error) setError(error.message);
+    else {
+      setClientForm({ name: '', phone: '', email: '', address: '' });
+      setNotice('Cliente guardado correctamente.');
+      await loadData();
+    }
+    setBusy(false);
+  }
+
+  async function addInvoice(e) {
+    e.preventDefault(); setBusy(true); setError(''); setNotice('');
+    const amount = Number(invoiceForm.amount);
+    if (!invoiceForm.client_id || !invoiceForm.description.trim() || !(amount > 0)) {
+      setError('Seleccioná un cliente, una descripción y un monto mayor que cero.');
+      setBusy(false); return;
+    }
+    const { error } = await supabase.from('invoices').insert({
+      user_id: session.user.id,
+      client_id: invoiceForm.client_id,
+      description: invoiceForm.description.trim(),
+      total: amount,
+      status: 'pendiente',
+      service_type: invoiceForm.service_type,
+      recurrence: invoiceForm.service_type === 'recurrente' ? invoiceForm.recurrence : null,
+      due_date: invoiceForm.due_date || null,
+      invoice_date: new Date().toISOString().slice(0, 10)
+    });
+    if (error) setError(error.message);
+    else {
+      setInvoiceForm({ client_id: '', description: '', amount: '', service_type: 'ocasional', recurrence: 'mensual', due_date: '' });
+      setNotice('Factura interna creada.');
+      await loadData();
+      setTab('invoices');
+    }
+    setBusy(false);
+  }
+
+  async function generateRecurringInvoices() {
+    if (!billingMonth) {
+      setError('Seleccioná el mes que querés facturar.');
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    setNotice('');
+
+    try {
+      const { data, error } = await supabase.rpc('generate_recurring_invoices', {
+        p_month: billingMonth + '-01'
+      });
+
+      if (error) throw error;
+
+      const count = Number(data || 0);
+      setNotice(
+        count === 0
+          ? 'No se generaron facturas nuevas para ese mes. Puede que no haya ciclos pendientes o que ya estén facturados.'
+          : 'Se generaron ' + count + ' factura(s) recurrente(s) correctamente.'
+      );
+
+      await loadData();
+    } catch (err) {
+      setError('No se pudieron generar las facturas: ' + (err.message || 'Error desconocido.'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addPayment(e) {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    setNotice('');
+
+    try {
+      const invoice = invoices.find(i => i.id === paymentForm.invoice_id);
+      const amount = Number(paymentForm.amount);
+      const alreadyPaid = (invoice?.payments || []).reduce(
+        (sum, p) => sum + Number(p.amount || 0),
+        0
+      );
+
+      if (
+        !invoice ||
+        !Number.isFinite(amount) ||
+        amount <= 0 ||
+        amount > Number(invoice.total) - alreadyPaid + 0.001
+      ) {
+        setError('Seleccioná una factura y un monto válido que no supere el saldo pendiente.');
+        return;
+      }
+
+      const { error: paymentError } = await supabase.rpc('register_payment', {
+        p_invoice_id: invoice.id,
+        p_amount: amount,
+        p_method: paymentForm.method,
+        p_reference: paymentForm.reference || null
+      });
+
+      if (paymentError) {
+        setError('No se pudo registrar el pago: ' + paymentError.message);
+        return;
+      }
+
+      setNotice('Pago registrado correctamente.');
+      setPaymentForm({
+        invoice_id: '',
+        amount: '',
+        method: 'efectivo',
+        reference: ''
+      });
+
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ocurrió un error al registrar el pago.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteInvoice(invoice) {
+    if (!invoice || !window.confirm('¿Eliminar esta factura y todos sus pagos asociados? Esta acción no se puede deshacer.')) return;
+    setBusy(true); setError(''); setNotice('');
+    const { error: paymentError } = await supabase
+      .from('payments').delete()
+      .eq('invoice_id', invoice.id)
+      .eq('user_id', session.user.id);
+    if (paymentError) {
+      setError('Error al eliminar los pagos: ' + paymentError.message);
+      setBusy(false); return;
+    }
+    const { error: invoiceError } = await supabase
+      .from('invoices').delete()
+      .eq('id', invoice.id)
+      .eq('user_id', session.user.id);
+    if (invoiceError) {
+      setError('Error al eliminar la factura: ' + invoiceError.message);
+    } else {
+      setNotice('Factura eliminada correctamente.');
+      await loadData();
+    }
+    setBusy(false);
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    setClients([]); setInvoices([]); setTab('dashboard');
+  }
+
+  const filteredClients = useMemo(() => clients.filter(c =>
+    `${c.name} ${c.phone || ''} ${c.email || ''}`.toLowerCase().includes(search.toLowerCase())
+  ), [clients, search]);
+
+  const totalBilled = invoices.reduce((sum, item) => sum + Number(item.total || 0), 0);
+  const pending = invoices.reduce((sum, item) => sum + Math.max(0, Number(item.total || 0) - (item.payments || []).reduce((s, p) => s + Number(p.amount || 0), 0)), 0);
+
+  if (!configured) return <SetupScreen />;
+  if (loading) return <div className="center-screen"><div className="loader" />Cargando…</div>;
+
+  if (!session) return (
+    <main className="login-shell">
+      <section className="login-card">
+        <div className="brand-mark"><FileText size={28} /></div>
+        <p className="eyebrow">ADMINISTRACIÓN</p>
+        <h1>Facturación Web</h1>
+        <p className="muted">Ingresá con tu cuenta de administrador.</p>
+        {error && <div className="alert"><CircleAlert size={18}/>{error}</div>}
+        <form onSubmit={signIn} className="stack">
+          <label>Correo electrónico<input type="email" value={email} onChange={e => setEmail(e.target.value)} required autoComplete="username" /></label>
+          <label>Contraseña<input type="password" value={password} onChange={e => setPassword(e.target.value)} required autoComplete="current-password" /></label>
+          <button className="primary full" disabled={busy}>{busy ? 'Ingresando…' : 'Iniciar sesión'}</button>
+        </form>
+        <p className="tiny">Creá el usuario administrador en Supabase Authentication antes de ingresar.</p>
+      </section>
+    </main>
+  );
+
+  const nav = [
+    ['dashboard', 'Resumen', LayoutDashboard],
+    ['clients', 'Clientes', Users],
+    ['invoices', 'Facturas', FileText],
+    ['payments', 'Pagos', Wallet]
+  ];
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><div className="brand-mark small"><FileText size={20}/></div><div><strong>Facturación</strong><span>Panel de control</span></div></div>
+        <div className="nav-label">MENÚ PRINCIPAL</div>
+        {nav.map(([id, label, Icon]) => <button key={id} className={`nav-item ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)}><Icon size={19}/>{label}{id === 'payments' && <span className="soon">Pronto</span>}</button>)}
+        <div className="sidebar-bottom"><div className="user-chip"><div className="avatar">{(session.user.email || 'A')[0].toUpperCase()}</div><div className="user-copy"><strong>Administrador</strong><span>{session.user.email}</span></div></div><button className="logout" onClick={signOut}><LogOut size={18}/> Cerrar sesión</button></div>
+      </aside>
+
+      <main className="main-area">
+        <header className="topbar"><div><p className="eyebrow">GESTIÓN DEL NEGOCIO</p><h1>{nav.find(n => n[0] === tab)?.[1] || 'Facturación'}</h1></div><button className="icon-button" onClick={loadData} title="Actualizar"><RefreshCw size={18}/></button></header>
+        {error && <div className="alert page-alert"><CircleAlert size={18}/>{error}</div>}
+        {notice && <div className="success page-alert">{notice}</div>}
+
+        {tab === 'dashboard' && <>
+          <div className="welcome"><div><h2>Hola, administrador</h2><p>Este es el estado actual de tu facturación.</p></div><button className="primary" onClick={() => setTab('new-invoice')}><Plus size={18}/> Nueva factura</button></div>
+          <div className="stats-grid">
+            <Stat icon={Users} label="Clientes registrados" value={clients.length} />
+            <Stat icon={FileText} label="Facturación acumulada" value={money(totalBilled)} />
+            <Stat icon={Wallet} label="Saldo por cobrar*" value={money(pending)} />
+          </div>
+          <section className="panel"><div className="panel-head"><div><h3>Facturas recientes</h3><p>Últimos documentos creados</p></div><button className="text-button" onClick={() => setTab('invoices')}>Ver todas</button></div><InvoiceTable invoices={invoices.slice(0, 5)} busy={busy} deleteInvoice={deleteInvoice} /></section>
+          <p className="tiny">*El saldo por cobrar se basa en el estado de la factura. El registro de pagos parciales se incorporará en una siguiente etapa.</p>
+        </>}
+
+        {tab === 'clients' && <section className="panel">
+          <div className="panel-head"><div><h3>Clientes</h3><p>Administrá los datos de tus clientes.</p></div><button className="primary" onClick={() => setTab('new-client')}><Plus size={18}/> Nuevo cliente</button></div>
+          <div className="searchbox"><Search size={18}/><input placeholder="Buscar por nombre, teléfono o correo" value={search} onChange={e => setSearch(e.target.value)}/></div>
+          <div className="table-wrap"><table><thead><tr><th>Nombre</th><th>Teléfono</th><th>Correo</th></tr></thead><tbody>{filteredClients.map(c => <tr key={c.id}><td>{c.name}</td><td>{c.phone || '—'}</td><td>{c.email || '—'}</td></tr>)}{!filteredClients.length && <tr><td colSpan="3" className="empty">Todavía no hay clientes registrados.</td></tr>}</tbody></table></div>
+        </section>}
+
+        {tab === 'new-client' && <section className="panel form-panel"><div className="panel-head"><div><h3>Registrar cliente</h3><p>Los campos con * son obligatorios.</p></div></div><form className="form-grid" onSubmit={addClient}><label>Nombre completo o razón social *<input value={clientForm.name} onChange={e => setClientForm({...clientForm, name:e.target.value})} required /></label><label>Teléfono<input value={clientForm.phone} onChange={e => setClientForm({...clientForm, phone:e.target.value})}/></label><label>Correo electrónico<input type="email" value={clientForm.email} onChange={e => setClientForm({...clientForm, email:e.target.value})}/></label><label>Dirección<input value={clientForm.address} onChange={e => setClientForm({...clientForm, address:e.target.value})}/></label><div className="form-actions"><button type="button" className="secondary" onClick={() => setTab('clients')}>Cancelar</button><button className="primary" disabled={busy}>Guardar cliente</button></div></form></section>}
+
+        {(tab === 'new-invoice' || tab === 'invoices') && <section className="panel">
+          <div className="panel-head"><div><h3>{tab === 'new-invoice' ? 'Crear factura interna' : 'Facturas'}</h3><p>{tab === 'new-invoice' ? 'Registrá el servicio y su monto.' : 'Historial de facturas registradas.'}</p></div>{tab === 'invoices' && <button className="primary" onClick={() => setTab('new-invoice')}><Plus size={18}/> Nueva factura</button>}</div>
+          {tab === 'new-invoice' ? <form className="form-grid" onSubmit={addInvoice}><label>Cliente *<select value={invoiceForm.client_id} onChange={e => setInvoiceForm({...invoiceForm, client_id:e.target.value})} required><option value="">Seleccionar cliente</option>{clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label><label>Tipo de servicio *<select value={invoiceForm.service_type} onChange={e => setInvoiceForm({...invoiceForm, service_type:e.target.value})}><option value="ocasional">Servicio ocasional</option><option value="recurrente">Servicio recurrente</option></select></label>{invoiceForm.service_type === 'recurrente' && <label>Frecuencia<select value={invoiceForm.recurrence} onChange={e => setInvoiceForm({...invoiceForm, recurrence:e.target.value})}><option value="semanal">Semanal</option><option value="mensual">Mensual</option><option value="trimestral">Trimestral</option><option value="anual">Anual</option></select></label>}<label>Descripción del servicio *<input value={invoiceForm.description} onChange={e => setInvoiceForm({...invoiceForm, description:e.target.value})} placeholder="Ej. Mantenimiento mensual" required /></label><label>Monto en córdobas (C$) *<input type="number" min="0.01" step="0.01" value={invoiceForm.amount} onChange={e => setInvoiceForm({...invoiceForm, amount:e.target.value})} required /></label><label>Fecha de vencimiento<input type="date" value={invoiceForm.due_date} onChange={e => setInvoiceForm({...invoiceForm, due_date:e.target.value})} /></label><div className="form-actions"><button type="button" className="secondary" onClick={() => setTab('invoices')}>Cancelar</button><button className="primary" disabled={busy || !clients.length}>Guardar factura</button></div>{invoiceForm.service_type === 'recurrente' && <p className="tiny">Esta versión registra la frecuencia elegida, pero todavía no genera automáticamente las facturas futuras.</p>}{!clients.length && <p className="tiny">Primero registrá al menos un cliente.</p>}</form> : <>
+            <div className="form-grid" style={{marginBottom: 22}}>
+              <label>Mes que querés facturar
+                <input
+                  type="month"
+                  value={billingMonth}
+                  onChange={e => setBillingMonth(e.target.value)}
+                  required
+                />
+              </label>
+              <div>
+                <p className="tiny">Genera las facturas recurrentes del mes seleccionado. Los ciclos ya registrados no se duplican.</p>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy || !billingMonth}
+                  onClick={generateRecurringInvoices}
+                >
+                  {busy ? 'Procesando…' : 'Generar facturas recurrentes'}
+                </button>
+              </div>
+            </div>
+            <InvoiceTable invoices={invoices} busy={busy} deleteInvoice={deleteInvoice} />
+          </> }
+        </section>}
+
+        {tab === 'payments' && <section className="panel"><div className="panel-head"><div><h3>Registrar pago</h3><p>Podés registrar abonos o cancelar una factura.</p></div></div><form className="form-grid" onSubmit={addPayment}><label>Factura pendiente *<select value={paymentForm.invoice_id} onChange={e => setPaymentForm({...paymentForm, invoice_id:e.target.value})} required><option value="">Seleccionar factura</option>{invoices.filter(i => Number(i.total) > (i.payments || []).reduce((s,p) => s + Number(p.amount || 0),0)).map(i => <option key={i.id} value={i.id}>{i.clients?.name} — {i.description} — saldo {money(Number(i.total) - (i.payments || []).reduce((s,p) => s + Number(p.amount || 0),0))}</option>)}</select></label><label>Monto recibido (C$) *<input type="number" min="0.01" step="0.01" value={paymentForm.amount} onChange={e => setPaymentForm({...paymentForm, amount:e.target.value})} required /></label><label>Método de pago<select value={paymentForm.method} onChange={e => setPaymentForm({...paymentForm, method:e.target.value})}><option value="efectivo">Efectivo</option><option value="transferencia">Transferencia</option><option value="deposito">Depósito</option><option value="tarjeta">Tarjeta</option><option value="otro">Otro</option></select></label><label>Referencia (opcional)<input value={paymentForm.reference} onChange={e => setPaymentForm({...paymentForm, reference:e.target.value})} placeholder="N.º de comprobante" /></label><div className="form-actions"><button className="primary" disabled={busy}>Guardar pago</button></div></form><div className="panel-head" style={{marginTop:28}}><div><h3>Historial de facturas</h3><p>Montos abonados y saldos se calculan con los pagos registrados.</p></div></div><InvoiceTable invoices={invoices} busy={busy} deleteInvoice={deleteInvoice} /></section>}
+      </main>
+    </div>
+  );
+}
+
+function Stat({ icon: Icon, label, value }) {
+  return <section className="stat-card"><div className="stat-icon"><Icon size={20}/></div><p>{label}</p><strong>{value}</strong><span className="stat-foot"><Activity size={14}/> Datos registrados</span></section>;
+}
+
+
+function makeInvoicePdf(i) {
+  const pdf = new jsPDF();
+  const paid = (i.payments || []).reduce((s, p) => s + Number(p.amount || 0), 0);
+  const total = Number(i.total || 0);
+  pdf.setFontSize(18);
+  pdf.text('FACTURA', 20, 20);
+  pdf.setFontSize(12);
+  [
+    'Numero: ' + (i.invoice_number || i.id),
+    'Fecha: ' + (i.invoice_date || ''),
+    'Cliente: ' + (i.clients?.name || ''),
+    'Servicio: ' + (i.description || ''),
+    'Vence: ' + (i.due_date || ''),
+    'Total: ' + money(total),
+    'Abonado: ' + money(paid),
+    'Saldo: ' + money(Math.max(0, total - paid))
+  ].forEach((line, n) => pdf.text(line, 20, 35 + n * 10));
+  return pdf;
+}
+function downloadInvoicePdf(i) {
+  makeInvoicePdf(i).save('Factura-' + (i.invoice_number || i.id) + '.pdf');
+}
+function shareInvoiceWhatsApp(i) {
+  downloadInvoicePdf(i);
+  window.open('https://wa.me/?text=' + encodeURIComponent('Factura ' + (i.invoice_number || '') + ' ' + (i.clients?.name || '')), '_blank');
+  alert('Adjunta en WhatsApp el PDF que se descargó.');
+}
+function printInvoice(i) {
+  const w = window.open(URL.createObjectURL(makeInvoicePdf(i).output('blob')), '_blank');
+  if (!w) {
+    downloadInvoicePdf(i);
+    alert('Abre el PDF descargado y elige Imprimir.');
+  } else {
+    setTimeout(() => { try { w.print(); } catch(e) {} }, 1000);
+  }
+}
+
+function InvoiceTable({ invoices, busy, deleteInvoice }) {
+  return <div className="table-wrap"><table><thead><tr><th>Fecha</th><th>Cliente</th><th>Servicio</th><th>Tipo</th><th>Vence</th><th>Total</th><th>Abonado</th><th>Saldo</th><th>Estado</th><th>Acción</th></tr></thead><tbody>{invoices.map(i => { const paid = (i.payments || []).reduce((s,p) => s + Number(p.amount || 0), 0); const balance = Math.max(0, Number(i.total || 0) - paid); return <tr key={i.id}><td>{i.invoice_date}</td><td>{i.clients?.name || '—'}</td><td>{i.description}</td><td>{i.service_type === 'recurrente' ? `Recurrente (${i.recurrence || 'mensual'})` : 'Ocasional'}</td><td>{i.due_date || '—'}</td><td className="amount">{money(i.total)}</td><td>{money(paid)}</td><td className="amount">{money(balance)}</td><td><span className={`status ${balance <= 0 ? 'paid' : 'pending'}`}>{balance <= 0 ? 'pagada' : 'pendiente'}</span></td><td><div style={{display:'flex',gap:4,flexWrap:'wrap'}}><button type="button" className="secondary" onClick={() => downloadInvoicePdf(i)}>PDF</button><button type="button" className="secondary" onClick={() => shareInvoiceWhatsApp(i)}>WhatsApp</button><button type="button" className="secondary" onClick={() => printInvoice(i)}>Imprimir</button><button type="button" className="secondary" disabled={busy} onClick={() => deleteInvoice(i)}>Eliminar</button></div></td></tr>; })}{!invoices.length && <tr><td colSpan="10" className="empty">No hay facturas todavía.</td></tr>}</tbody></table></div>;
+}
+
+function SetupScreen() {
+  return <main className="login-shell"><section className="login-card setup-card"><div className="brand-mark"><FileText size={28}/></div><p className="eyebrow">CONFIGURACIÓN INICIAL</p><h1>Conectá tu base de datos</h1><p className="muted">La interfaz está lista, pero falta configurar las credenciales de Supabase para guardar información de forma segura.</p><ol><li>Creá un proyecto en Supabase.</li><li>Ejecutá el archivo <code>supabase/schema.sql</code> en SQL Editor.</li><li>Copiá <code>.env.example</code> a <code>.env</code> y agregá la URL y la clave pública.</li><li>Creá tu usuario administrador en Authentication.</li></ol><p className="tiny">No compartás tu contraseña ni claves privadas. Nunca uses la clave service_role en el navegador.</p></section></main>;
+}
